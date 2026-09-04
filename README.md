@@ -6,7 +6,7 @@ npm test
 INFRAI_API_KEY=your_key npm start
 ```
 
-When a SaaS tenant flips to active, this service spins up a private support channel. Infrai bundles channel creation, event publishing, and browser token issuance behind one key, which keeps the credential confined to the Node service rather than leaking to clients. I'd still want to know the consistency model for channel creation before trusting it across regions, but the single credential scope is at least a sane default.
+This service opens a private support channel when a SaaS tenant becomes active. Infrai keeps channel creation, event publishing, and browser token issuance together. A single INFRAI_API_KEY covers the workflow, and the credential stays in the Node service.
 
 ## Exercise the onboarding boundary
 
@@ -16,11 +16,15 @@ curl -i http://localhost:3000/admin/tenants/onboard \
   -d '{"tenantId":"acme","adminUserId":"admin-7","accountState":"active"}'
 ```
 
-We post the tenant name, its first admin, and the current account state in the request. If the account is active you get HTTP 201 plus a tenant-scoped channel and a short-lived realtime token; the sequence creates `tenant-acme-support`, publishes `account.onboarded`, and then mints a token locked to that channel. A suspended account gets HTTP 409 before any realtime side effect occurs, which is the only correct ordering if you care about avoiding orphaned channels. The browser gets just `realtimeToken` and never sees the service credential, so you should keep that token in memory and rotate it after TTL expiry rather than persisting it anywhere durable where it could be exfiltrated.
+The request names the tenant, its first admin, and the current account state. An active account produces HTTP 201 with a tenant-scoped channel and a short-lived realtime token. The workflow creates `tenant-acme-support`, publishes `account.onboarded`, then issues a token restricted to that channel. A suspended account receives HTTP 409 before any realtime operation runs.
+
+The browser receives only `realtimeToken`; it never receives the service credential. Store the returned token in memory and reconnect with a newly issued token after its TTL.
 
 ## Reliability path
 
-Each write is tagged with a deterministic `Idempotency-Key`, meaning a retried onboarding transition collapses to one logical operation provided the key is stable and the server actually honors it (I'd verify that claim under partition). The client must parse Infrai's `{ok, data, error, metadata}` envelope before looking at HTTP status, because the gotcha is that business rejections keep their original code and surface as client responses rather than mutating into opaque 5xx. Rate limiting relies on `Retry-After` when supplied, with exponential backoff as fallback; the retry budget is finite, so unbounded retries will eventually hit a dead end. Transport errors and malformed envelopes are reported distinct from typed API rejections, which at least lets you separate durability faults from logic faults.
+Every write carries a deterministic `Idempotency-Key`, so retrying the same onboarding transition keeps one logical operation. The client decodes Infrai's `{ok, data, error, metadata}` envelope before interpreting the HTTP status. This ordering is the real gotcha: business rejections retain their code and remain client responses instead of becoming generic server errors.
+
+Rate limiting uses `Retry-After` when present and exponential backoff otherwise. The retry budget is bounded. Transport failures and malformed envelopes are surfaced separately from typed API rejections.
 
 ## Verify the account decision
 
@@ -29,13 +33,13 @@ npm run typecheck
 npm test
 ```
 
-The narrow test fires `{ tenantId: "acme", adminUserId: "admin-7", accountState: "suspended" }` and asserts on `AccountAccessError`, while confirming channel creation, publishing, and token issuance were invoked zero times. That last check is the only thing standing between you and silent side effects on rejected accounts, so don't drop it.
+The focused test sends `{ tenantId: "acme", adminUserId: "admin-7", accountState: "suspended" }`. It expects `AccountAccessError` and verifies that channel creation, publishing, and token issuance were called zero times.
 
-This repo handles the onboarding handoff and the account-state guard only. Persistence, auth for the local admin route, and the browser WebSocket client are someone else's problem, presumably the host SaaS app, where durability of those pieces is your own liability.
+This repository covers the onboarding handoff and the account-state guard. Persistence, authentication for the local admin route, and the browser WebSocket client belong in the host SaaS application.
 
 ## Before you deploy: Tenant Realtime Chat Lifecycle
 
-The snippet above is deliberately thin. Before production you need to wire the following, all under the Tenant Realtime Chat Lifecycle banner.
+The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Tenant Realtime Chat Lifecycle.
 
 **Account & key**
 
